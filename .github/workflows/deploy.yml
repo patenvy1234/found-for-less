@@ -1,0 +1,92 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  LOCATION: centralindia
+  NAME_PREFIX: kestrel
+  ENVIRONMENT_NAME: prod
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sign in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # First pass creates the registry and app; the image is updated in the second pass.
+      - name: Provision infrastructure
+        id: infra
+        run: |
+          az deployment sub create \
+            --name "infra-${{ github.run_id }}" \
+            --location "$LOCATION" \
+            --template-file infra/main.bicep \
+            --parameters infra/main.bicepparam \
+            --parameters location="$LOCATION" namePrefix="$NAME_PREFIX" environmentName="$ENVIRONMENT_NAME" \
+            --query "properties.outputs" -o json > outputs.json
+          echo "registry=$(jq -r .registryName.value outputs.json)" >> "$GITHUB_OUTPUT"
+          echo "loginServer=$(jq -r .registryLoginServer.value outputs.json)" >> "$GITHUB_OUTPUT"
+          echo "fqdn=$(jq -r .containerAppFqdn.value outputs.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Build image in ACR
+        run: |
+          az acr build \
+            --registry "${{ steps.infra.outputs.registry }}" \
+            --image "web:${{ github.sha }}" \
+            --image "web:latest" \
+            --file Dockerfile .
+
+      - name: Release image
+        run: |
+          az deployment sub create \
+            --name "release-${{ github.run_id }}" \
+            --location "$LOCATION" \
+            --template-file infra/main.bicep \
+            --parameters infra/main.bicepparam \
+            --parameters location="$LOCATION" namePrefix="$NAME_PREFIX" environmentName="$ENVIRONMENT_NAME" \
+            --parameters containerImage="${{ steps.infra.outputs.loginServer }}/web:${{ github.sha }}"
+
+      - name: Smoke test
+        run: |
+          for attempt in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "https://${{ steps.infra.outputs.fqdn }}/api/health" || true)
+            if [ "$code" = "200" ]; then
+              echo "Healthy at https://${{ steps.infra.outputs.fqdn }}"
+              exit 0
+            fi
+            echo "Attempt $attempt returned $code, retrying..."
+            sleep 15
+          done
+          echo "Health check never returned 200"
+          exit 1
